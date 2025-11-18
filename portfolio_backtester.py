@@ -3,13 +3,21 @@ portfolio_backtester.py
 
 Simple portfolio backtester using Stooq data via pandas-datareader.
 
+Improvements:
+- Configurable annual risk-free rate for Sharpe Ratio calculation.
+- Optional benchmark stats.
+- Cleaned argument parsing and error handling.
+
+Dependencies:
+    pip install pandas numpy pandas-datareader matplotlib
+
 Features:
 - Fetches daily prices for multiple tickers
 - Builds an equally-weighted or custom-weighted portfolio
 - Computes:
     * Daily & cumulative returns
     * Annualised return & volatility
-    * Sharpe ratio (rf ≈ 0)
+    * Sharpe ratio (configurable with risk-free rate)
     * Max drawdown
     * Best/worst day
 - Per-asset stats table (return, volatility, Sharpe)
@@ -36,39 +44,50 @@ TRADING_DAYS = 252
 
 # ---------------------- Date helpers ---------------------- #
 
+
 def parse_date(s: str) -> datetime:
     """Parse YYYY-MM-DD date string into datetime."""
     try:
         return datetime.strptime(s, "%Y-%m-%d")
-    except ValueError:
-        raise argparse.ArgumentTypeError(f"Invalid date format: {s}. Use YYYY-MM-DD.")
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"Invalid date format: {s}. Use YYYY-MM-DD."
+        ) from exc
 
 
 # ---------------------- Data Loading ---------------------- #
+
 
 def _to_stooq_ticker(t: str) -> str:
     """
     Convert a ticker to Stooq format.
     For US stocks: 'AAPL' -> 'AAPL.US'
+    Leaves indices / already-qualified tickers unchanged, e.g. '^SPX', 'AAPL.US'.
     """
-    return t + ".US" if "." not in t else t
+    t = t.strip()
+    if not t:
+        return t
+    if "." in t or "^" in t:
+        return t
+    return t + ".US"
 
 
-def load_prices_stooq(tickers, start, end) -> pd.DataFrame:
+def load_prices_stooq(tickers: list[str], start: datetime, end: datetime) -> pd.DataFrame:
     """
     Load close prices for multiple tickers from Stooq.
 
     Returns DataFrame indexed by date with one column per ticker.
     Exits if no valid data or no overlapping dates.
     """
-    price_data = {}
+    price_data: dict[str, pd.Series] = {}
 
     for t in tickers:
         stooq_ticker = _to_stooq_ticker(t)
         print(f"Downloading data for {stooq_ticker} ({start.date()} -> {end.date()})...")
         try:
+            # web.DataReader returns prices in descending order, we sort later
             df = web.DataReader(stooq_ticker, "stooq", start=start, end=end)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"Error fetching data for {t}: {e}")
             continue
 
@@ -97,27 +116,28 @@ def load_prices_stooq(tickers, start, end) -> pd.DataFrame:
     return prices
 
 
-def load_single_price_stooq(ticker: str, start, end) -> pd.Series:
+def load_single_price_stooq(ticker: str, start: datetime, end: datetime) -> pd.Series:
     """Load a single benchmark series (Close) from Stooq."""
     stooq_ticker = _to_stooq_ticker(ticker)
     print(f"Downloading benchmark {stooq_ticker} ({start.date()} -> {end.date()})...")
     try:
         df = web.DataReader(stooq_ticker, "stooq", start=start, end=end)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"Warning: could not fetch benchmark {ticker}: {e}")
-        return pd.Series(dtype=float)
+        return pd.Series(dtype=float, name=ticker)
 
     if df.empty or "Close" not in df.columns:
         print(f"Warning: empty or invalid benchmark data for {ticker}")
-        return pd.Series(dtype=float)
+        return pd.Series(dtype=float, name=ticker)
 
     df = df.sort_index()
-    return df["Close"]
+    return df["Close"].rename(ticker)
 
 
 # ---------------------- Portfolio Logic ---------------------- #
 
-def normalise_weights(raw_weights, n_assets):
+
+def normalise_weights(raw_weights: list[float] | None, n_assets: int) -> np.ndarray:
     """
     Convert raw weights (list or None) into a proper weight vector that sums to 1.
     """
@@ -129,22 +149,27 @@ def normalise_weights(raw_weights, n_assets):
         if len(w) != n_assets:
             print("Error: number of weights must match number of tickers.")
             sys.exit(1)
-        if np.allclose(w.sum(), 0):
-            print("Error: sum of weights is zero.")
+        # Check if weights sum to near zero, which is likely an error
+        if np.isclose(w.sum(), 0):
+            print("Error: sum of weights is zero or near zero.")
             sys.exit(1)
         w = w / w.sum()
     return w
 
 
-def compute_portfolio_stats(prices: pd.DataFrame,
-                            weights: np.ndarray,
-                            initial_value: float = 1_000.0):
+def compute_portfolio_stats(
+    prices: pd.DataFrame,
+    weights: np.ndarray,
+    initial_value: float = 1_000.0,
+    risk_free_rate: float = 0.0,
+) -> tuple[pd.DataFrame, dict, pd.DataFrame]:
     """
     Given price DataFrame (Date x Asset) and weights, compute portfolio stats.
 
     Returns:
         portfolio_df: DataFrame with 'portfolio_value' and 'portfolio_return'
         stats: dict with summary metrics
+        asset_returns: DataFrame with daily asset returns
     """
     # Compute daily returns for each asset
     asset_returns = prices.pct_change().dropna()
@@ -155,12 +180,14 @@ def compute_portfolio_stats(prices: pd.DataFrame,
     # Portfolio value over time
     port_value = (1 + port_ret).cumprod() * initial_value
 
-    portfolio_df = pd.DataFrame({
-        "portfolio_value": port_value,
-        "portfolio_return": port_ret
-    })
+    portfolio_df = pd.DataFrame(
+        {
+            "portfolio_value": port_value,
+            "portfolio_return": port_ret,
+        }
+    )
 
-    # Stats
+    # --- Stats Calculation ---
     start_date = port_value.index[0].date()
     end_date = port_value.index[-1].date()
     start_val = float(port_value.iloc[0])
@@ -168,14 +195,16 @@ def compute_portfolio_stats(prices: pd.DataFrame,
 
     total_return = end_val / start_val - 1
 
-    # Use log returns for annualised stats
+    # Use log returns for more accurate annualised stats (compounding)
     log_ret = np.log(1 + port_ret)
     mean_log_daily = log_ret.mean()
     vol_log_daily = log_ret.std()
 
     ann_return = math.exp(mean_log_daily * TRADING_DAYS) - 1
     ann_vol = vol_log_daily * math.sqrt(TRADING_DAYS)
-    sharpe = ann_return / ann_vol if ann_vol != 0 else np.nan
+
+    # Sharpe Ratio: (Annualized Return - Risk-Free Rate) / Annualized Volatility
+    sharpe = (ann_return - risk_free_rate) / ann_vol if ann_vol != 0 else np.nan
 
     # Max drawdown
     running_max = port_value.cummax()
@@ -207,7 +236,10 @@ def compute_portfolio_stats(prices: pd.DataFrame,
     return portfolio_df, stats, asset_returns
 
 
-def compute_per_asset_stats(asset_returns: pd.DataFrame):
+def compute_per_asset_stats(
+    asset_returns: pd.DataFrame,
+    risk_free_rate: float = 0.0,
+) -> pd.DataFrame:
     """
     Compute annualised return, volatility and Sharpe per asset.
     Returns a DataFrame (asset x metric).
@@ -219,18 +251,25 @@ def compute_per_asset_stats(asset_returns: pd.DataFrame):
 
     ann_return = np.exp(mean_log_daily * TRADING_DAYS) - 1
     ann_vol = vol_log_daily * np.sqrt(TRADING_DAYS)
-    sharpe = ann_return / ann_vol.replace(0, np.nan)
 
-    stats_df = pd.DataFrame({
-        "ann_return_pct": ann_return * 100,
-        "ann_vol_pct": ann_vol * 100,
-        "sharpe": sharpe,
-    })
+    # Sharpe Ratio: (Annualized Return - Risk-Free Rate) / Annualized Volatility
+    sharpe = (ann_return - risk_free_rate) / ann_vol.replace(0, np.nan)
+
+    stats_df = pd.DataFrame(
+        {
+            "ann_return_pct": ann_return * 100,
+            "ann_vol_pct": ann_vol * 100,
+            "sharpe": sharpe,
+        }
+    )
 
     return stats_df
 
 
-def compute_benchmark_stats(benchmark: pd.Series):
+def compute_benchmark_stats(
+    benchmark: pd.Series,
+    risk_free_rate: float = 0.0,
+) -> dict | None:
     """
     Compute simple stats for a benchmark series (Close prices).
     """
@@ -246,7 +285,9 @@ def compute_benchmark_stats(benchmark: pd.Series):
 
     ann_return = math.exp(mean_log_daily * TRADING_DAYS) - 1
     ann_vol = vol_log_daily * math.sqrt(TRADING_DAYS)
-    sharpe = ann_return / ann_vol if ann_vol != 0 else np.nan
+
+    # Sharpe Ratio: (Annualized Return - Risk-Free Rate) / Annualized Volatility
+    sharpe = (ann_return - risk_free_rate) / ann_vol if ann_vol != 0 else np.nan
 
     start_price = float(benchmark.iloc[0])
     end_price = float(benchmark.iloc[-1])
@@ -262,17 +303,24 @@ def compute_benchmark_stats(benchmark: pd.Series):
     }
 
 
-def print_portfolio_summary(tickers, weights, stats, asset_stats=None, benchmark_stats=None):
+def print_portfolio_summary(
+    tickers: list[str],
+    weights: np.ndarray,
+    stats: dict,
+    risk_free_rate: float,
+    asset_stats: pd.DataFrame | None = None,
+    benchmark_stats: dict | None = None,
+) -> None:
     print("\n================ PORTFOLIO SUMMARY ================")
     print(f"Tickers: {', '.join(tickers)}")
     print(f"Weights: {', '.join(f'{w:.2f}' for w in weights)} (normalised)")
-    print(f"Period:       {stats['start_date']} -> {stats['end_date']}")
+    print(f"Period:        {stats['start_date']} -> {stats['end_date']}")
     print(f"Initial value: {stats['initial_value']:.2f}")
     print(f"Final value:   {stats['final_value']:.2f}")
     print(f"Total return:  {stats['total_return_pct']:.2f}%")
     print(f"Ann. return:   {stats['ann_return_pct']:.2f}%")
     print(f"Ann. vol:      {stats['ann_vol_pct']:.2f}%")
-    print(f"Sharpe (rf≈0): {stats['sharpe']:.2f}")
+    print(f"Sharpe (rf={risk_free_rate:.2f}): {stats['sharpe']:.2f}")
     print(f"Max drawdown:  {stats['max_drawdown_pct']:.2f}%")
     print(f"Best day:      {stats['best_day']}  ({stats['best_day_pct']:.2f}%)")
     print(f"Worst day:     {stats['worst_day']} ({stats['worst_day_pct']:.2f}%)")
@@ -295,41 +343,47 @@ def print_portfolio_summary(tickers, weights, stats, asset_stats=None, benchmark
 
 # ---------------------- Plotting ---------------------- #
 
-def plot_portfolio_and_assets(prices: pd.DataFrame,
-                              portfolio_df: pd.DataFrame,
-                              benchmark: pd.Series | None = None):
+
+def plot_portfolio_and_assets(
+    prices: pd.DataFrame,
+    portfolio_df: pd.DataFrame,
+    benchmark: pd.Series | None = None,
+) -> None:
     """
     Plot portfolio value vs each individual asset (normalised to 1.0).
     If benchmark is provided, also plot it.
     """
-    plt.figure(figsize=(10, 6))
+    plt.style.use("seaborn-v0_8-darkgrid")
+    plt.figure(figsize=(12, 7))
 
     # Normalise asset prices to start at 1.0
     norm_prices = prices / prices.iloc[0]
     for col in norm_prices.columns:
-        plt.plot(norm_prices.index, norm_prices[col], label=col, alpha=0.7)
+        plt.plot(norm_prices.index, norm_prices[col], label=col, alpha=0.6, linewidth=1.5)
 
     # Normalise portfolio so it also starts at 1.0 for visual comparison
     port_norm = portfolio_df["portfolio_value"] / portfolio_df["portfolio_value"].iloc[0]
-    plt.plot(port_norm.index, port_norm, label="PORTFOLIO", linewidth=2)
+    plt.plot(port_norm.index, port_norm, label="PORTFOLIO", linewidth=3)
 
     if benchmark is not None and not benchmark.empty:
         bench_norm = benchmark / benchmark.iloc[0]
-        plt.plot(bench_norm.index, bench_norm, label="BENCHMARK", linestyle="--")
+        bench_name = benchmark.name if benchmark.name else "BENCHMARK"
+        plt.plot(bench_norm.index, bench_norm, label=bench_name, linestyle="--", linewidth=2)
 
-    plt.title("Portfolio vs Assets (and benchmark) – normalised to 1.0")
-    plt.xlabel("Date")
-    plt.ylabel("Normalised value")
-    plt.legend()
-    plt.grid(True)
+    plt.title("Portfolio vs Assets and Benchmark (Normalised to 1.0)", fontsize=16)
+    plt.xlabel("Date", fontsize=12)
+    plt.ylabel("Normalised Value", fontsize=12)
+    plt.legend(loc="upper left")
+    plt.grid(True, linestyle=":", alpha=0.7)
     plt.tight_layout()
 
 
 # ---------------------- CLI ---------------------- #
 
-def parse_args():
+
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Simple portfolio backtester using Stooq data (educational)."
+        description="Simple portfolio backtester using Stooq data (educational only, not financial advice)."
     )
     parser.add_argument(
         "--tickers",
@@ -341,19 +395,21 @@ def parse_args():
         "--weights",
         type=str,
         default=None,
-        help="Optional comma-separated weights, e.g. '0.5,0.3,0.2'. "
-             "If omitted, equal weights are used.",
+        help=(
+            "Optional comma-separated weights, e.g. '0.5,0.3,0.2'. "
+            "If omitted, equal weights are used."
+        ),
     )
     parser.add_argument(
         "--start",
         type=parse_date,
-        default="2015-01-01",
+        default=parse_date("2015-01-01"),
         help="Start date YYYY-MM-DD (default: 2015-01-01)",
     )
     parser.add_argument(
         "--end",
         type=parse_date,
-        default=datetime.today().strftime("%Y-%m-%d"),
+        default=datetime.today(),
         help="End date YYYY-MM-DD (default: today)",
     )
     parser.add_argument(
@@ -369,6 +425,12 @@ def parse_args():
         help="Optional benchmark ticker (e.g. 'SPY').",
     )
     parser.add_argument(
+        "--risk-free-rate",
+        type=float,
+        default=0.0,
+        help="Annual risk-free rate for Sharpe calculation (e.g. 0.03 for 3%). Default is 0.0.",
+    )
+    parser.add_argument(
         "--no-plots",
         action="store_true",
         help="If set, do not show plots (summary only).",
@@ -382,7 +444,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def main():
+def main() -> None:
     args = parse_args()
 
     if args.start >= args.end:
@@ -405,29 +467,40 @@ def main():
 
     print(f"Running portfolio backtest for: {', '.join(tickers)}")
     print(f"Period: {args.start.date()} -> {args.end.date()}")
-    print(f"Initial value: {args.initial:.2f}\n")
+    print(f"Initial value: {args.initial:.2f}")
+    print(f"Risk-free rate (rf): {args.risk_free_rate * 100:.2f}%\n")
 
     prices = load_prices_stooq(tickers, args.start, args.end)
     weights = normalise_weights(raw_weights, n_assets=len(prices.columns))
 
     portfolio_df, stats, asset_returns = compute_portfolio_stats(
-        prices, weights, initial_value=args.initial
+        prices,
+        weights,
+        initial_value=args.initial,
+        risk_free_rate=args.risk_free_rate,
     )
-    asset_stats = compute_per_asset_stats(asset_returns)
+    asset_stats = compute_per_asset_stats(asset_returns, risk_free_rate=args.risk_free_rate)
 
     benchmark_stats = None
     benchmark_series = pd.Series(dtype=float)
 
     if args.benchmark:
-        benchmark_series = load_single_price_stooq(args.benchmark.upper(),
-                                                   args.start, args.end)
+        benchmark_series = load_single_price_stooq(
+            args.benchmark.upper(),
+            args.start,
+            args.end,
+        )
         if not benchmark_series.empty:
-            benchmark_stats = compute_benchmark_stats(benchmark_series)
+            benchmark_stats = compute_benchmark_stats(
+                benchmark_series,
+                risk_free_rate=args.risk_free_rate,
+            )
 
     print_portfolio_summary(
         list(prices.columns),
         weights,
         stats,
+        args.risk_free_rate,
         asset_stats=asset_stats,
         benchmark_stats=benchmark_stats,
     )
@@ -436,7 +509,7 @@ def main():
         try:
             portfolio_df.to_csv(args.out_csv, index=True)
             print(f"Saved portfolio equity curve to {args.out_csv}")
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"Warning: could not save CSV to {args.out_csv}: {e}")
 
     if not args.no_plots:
